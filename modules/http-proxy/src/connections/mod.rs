@@ -12,9 +12,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use crossbeam_queue::SegQueue;
 use rustc_hash::FxHashMap;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Notify;
 
 mod pool;
 mod stats;
@@ -49,16 +48,47 @@ thread_local! {
     static TLS_POOLS: UnsafeCell<Option<ThreadLocalPools>> = const { UnsafeCell::new(None) };
 }
 
-#[allow(clippy::type_complexity)]
-static PENDING_PULLS: LazyLock<
-    parking_lot::RwLock<
-        FxHashMap<(Option<Arc<ResolvedUpstream>>, bool), SegQueue<CancellationToken>>,
-    >,
-> = LazyLock::new(|| parking_lot::RwLock::new(FxHashMap::default()));
+/// Key that a request parks on while the corresponding limit is reached.
+///
+/// The first element is the upstream whose local limit blocked the request, or
+/// `None` when the global limit did; the second element separates the TCP and
+/// Unix-socket pools, which release independently; the third is the worker
+/// thread that owns the pool. Pools are thread-local, so capacity freed on one
+/// thread can only be used by waiters on that same thread.
+type WaiterKey = (Option<Arc<ResolvedUpstream>>, bool, ThreadId);
 
-/// Fast-path flag for PENDING_PULLS: when zero, no thread is waiting for a
-/// connection and `return_connection_to_pool` can skip the read lock entirely.
-static PENDING_PULL_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Wake handles for requests waiting on pool capacity.
+///
+/// `Notify` stores no permits: [`Notify::notify_waiters`] reaches exactly the
+/// tasks registered at that instant, and a waiter registers (via
+/// `Notified::enable`) before it re-checks the pool. That makes the handoff
+/// immune to both failure modes of a token queue - a waiter dropped by the
+/// pipeline timeout cannot swallow a wake meant for a live waiter, and a
+/// release landing between the pool check and the await is still observed.
+static PENDING_WAITERS: LazyLock<RwLock<FxHashMap<WaiterKey, Arc<Notify>>>> =
+    LazyLock::new(|| RwLock::new(FxHashMap::default()));
+
+/// Returns the wake handle for `key`, creating it on first use.
+///
+/// Unused entries are pruned while the map is held for writing; a live waiter
+/// keeps a second reference to its handle, so a strong count of one means no
+/// task is parked on it.
+fn waiter_notify(key: &WaiterKey) -> Arc<Notify> {
+    if let Some(notify) = PENDING_WAITERS
+        .read()
+        .expect("pool waiter lock poisoned")
+        .get(key)
+    {
+        return notify.clone();
+    }
+
+    let mut waiters = PENDING_WAITERS.write().expect("pool waiter lock poisoned");
+    waiters.retain(|_, notify| Arc::strong_count(notify) > 1);
+    waiters
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(Notify::new()))
+        .clone()
+}
 
 /// Concrete pool item type used throughout the proxy.
 pub struct PooledConnection {
@@ -107,11 +137,34 @@ impl std::ops::DerefMut for PooledConnection {
 impl Drop for PooledConnection {
     #[inline]
     fn drop(&mut self) {
+        let empty_slot = self
+            .inner
+            .as_ref()
+            .is_some_and(|item| item.inner().is_none());
+        let local_limit_key = self
+            .inner
+            .as_ref()
+            .and_then(|item| item.local_limit_key().cloned());
+        let is_unix = self
+            .inner
+            .as_ref()
+            .and_then(|item| item.key())
+            .is_some_and(|key| key.0.proxy_unix.is_some());
+
         if let Some(key) = self.inner.as_ref().and_then(|k| k.key()) {
-            let stored = self.inner.as_ref().is_some_and(|i| i.inner().is_some()); // See what's in `pool.rs`...
+            let stored = !empty_slot;
             let thread_id = get_tls_thread_id();
             POOL_STATS.record_return(thread_id, &key.0, stored);
         }
+
+        // Drop the item first: its own drop updates the pool accounting.
+        drop(self.inner.take());
+
+        // Any released slot frees capacity this thread's waiters can use:
+        // both an established connection returned by `PoolItem::drop` (which
+        // goes through the generic pool-level return path and cannot notify)
+        // and a slot whose connection was never established.
+        wake_pool_waiters(&local_limit_key, is_unix);
     }
 }
 
@@ -187,63 +240,48 @@ impl ConnectionManager {
             .store(per_thread, Ordering::Relaxed);
     }
 
+    /// Whether the given upstream already holds its local connection limit on
+    /// this thread.
     #[inline]
-    async fn wait_until_available(
-        &self,
-        upstream: Arc<ResolvedUpstream>,
-        local_limit: Option<usize>,
-    ) {
-        // Check if local limit is exceeded
-        let at_local_limit = if let Some(ll) = local_limit {
-            TLS_POOLS.with(|c| {
-                let ptr = c.get();
-                let opt = unsafe { &mut *ptr };
-                opt.as_ref().is_some_and(|p| {
-                    if upstream.proxy_unix.is_some() {
-                        #[cfg(unix)]
-                        let r = p.unix_pool.is_at_local_limit(&upstream, ll);
-                        #[cfg(not(unix))]
-                        let r = false;
+    fn at_local_limit(&self, upstream: &Arc<ResolvedUpstream>, local_limit: Option<usize>) -> bool {
+        let Some(local_limit) = local_limit else {
+            return false;
+        };
 
-                        r
-                    } else {
-                        p.tcp_pool.is_at_local_limit(&upstream, ll)
-                    }
-                })
+        TLS_POOLS.with(|c| {
+            let ptr = c.get();
+            // SAFETY: pool access is confined to the thread that owns it; see the
+            // `ThreadLocalPools` documentation.
+            let opt = unsafe { &*ptr };
+            opt.as_ref().is_some_and(|p| {
+                if upstream.proxy_unix.is_some() {
+                    #[cfg(unix)]
+                    let result = p.unix_pool.is_at_local_limit(upstream, local_limit);
+                    #[cfg(not(unix))]
+                    let result = false;
+
+                    result
+                } else {
+                    p.tcp_pool.is_at_local_limit(upstream, local_limit)
+                }
             })
-        } else {
-            false
-        };
+        })
+    }
 
-        // Pool likely under capacity, wait for a connection to become available
-        // Had to wrap in `{ ... }` to prevent subtle `PENDING_PULLS` deadlock,
-        // because the lock was held across async boundary.
-        PENDING_PULL_COUNT.fetch_add(1, Ordering::Relaxed);
-        let cancel_token = {
-            // Fast path: concurrent read lock (multiple threads can access simultaneously)
-            let pending_pulls_key = (
-                at_local_limit.then_some(upstream.clone()),
-                upstream.proxy_unix.is_some(),
-            );
-            let cancel_token = CancellationToken::new();
-
-            let pending_pulls_read = PENDING_PULLS.read();
-            let queue_opt = pending_pulls_read.get(&pending_pulls_key);
-            if let Some(queue) = queue_opt {
-                queue.push(cancel_token.clone());
-            } else {
-                drop(pending_pulls_read);
-                // Slow path: upgrade to write lock only if the queue doesn't exist yet
-                let mut write_lock = PENDING_PULLS.write();
-                let queue = write_lock.entry(pending_pulls_key).or_default();
-                queue.push(cancel_token.clone());
-            }
-
-            cancel_token
-        };
-
-        // Wait for the connection to be available.
-        cancel_token.cancelled().await;
+    /// Returns the wake handle a request parks on while its limit is reached.
+    ///
+    /// The key is the limit that blocked the request: the upstream when its
+    /// local limit is hit, otherwise the global key. Releases notify by the same
+    /// key, so a wake is never spent on a request that the release cannot help.
+    #[inline]
+    fn waiter(&self, upstream: &Arc<ResolvedUpstream>, local_limit: Option<usize>) -> Arc<Notify> {
+        let key = (
+            self.at_local_limit(upstream, local_limit)
+                .then(|| upstream.clone()),
+            upstream.proxy_unix.is_some(),
+            std::thread::current().id(),
+        );
+        waiter_notify(&key)
     }
 
     /// Pulls a connection from the pool, waiting if necessary for one to become available.
@@ -255,12 +293,18 @@ impl ConnectionManager {
         idle_timeout: Duration,
     ) -> PooledConnection {
         loop {
+            let notify = self.waiter(&upstream, None);
+            let mut notified = std::pin::pin!(notify.notified_owned());
+            // Register before the pool check: a release that lands between the
+            // check and the await would otherwise be missed.
+            notified.as_mut().enable();
+
             if let Some(conn) = self.try_pull(upstream.clone(), client_ip, idle_timeout) {
                 // Pool not under capacity.
                 return conn;
             }
 
-            self.wait_until_available(upstream.clone(), None).await;
+            notified.await;
         }
     }
 
@@ -277,6 +321,10 @@ impl ConnectionManager {
         idle_timeout: Duration,
     ) -> PooledConnection {
         loop {
+            let notify = self.waiter(&upstream, local_limit);
+            let mut notified = std::pin::pin!(notify.notified_owned());
+            notified.as_mut().enable();
+
             if let Some(conn) = self.try_pull_with_local_limit(
                 upstream.clone(),
                 client_ip,
@@ -287,8 +335,7 @@ impl ConnectionManager {
                 return conn;
             }
 
-            self.wait_until_available(upstream.clone(), local_limit)
-                .await;
+            notified.await;
         }
     }
 
@@ -301,15 +348,17 @@ impl ConnectionManager {
         idle_timeout: Duration,
     ) -> PooledConnection {
         loop {
-            if let Some(conn) = self
-                .try_pull(upstream.clone(), client_ip, idle_timeout)
-                .filter(|c| c.inner().is_some())
+            let notify = self.waiter(&upstream, None);
+            let mut notified = std::pin::pin!(notify.notified_owned());
+            notified.as_mut().enable();
+
+            if let Some(conn) = self.try_pull_idle(upstream.clone(), client_ip, None, idle_timeout)
             {
                 // Pool not under capacity.
                 return conn;
             }
 
-            self.wait_until_available(upstream.clone(), None).await;
+            notified.await;
         }
     }
 
@@ -326,17 +375,58 @@ impl ConnectionManager {
         idle_timeout: Duration,
     ) -> PooledConnection {
         loop {
-            if let Some(conn) = self
-                .try_pull_with_local_limit(upstream.clone(), client_ip, local_limit, idle_timeout)
-                .filter(|c| c.inner().is_some())
+            let notify = self.waiter(&upstream, local_limit);
+            let mut notified = std::pin::pin!(notify.notified_owned());
+            notified.as_mut().enable();
+
+            if let Some(conn) =
+                self.try_pull_idle(upstream.clone(), client_ip, local_limit, idle_timeout)
             {
                 // Pool not under capacity.
                 return conn;
             }
 
-            self.wait_until_available(upstream.clone(), local_limit)
-                .await;
+            notified.await;
         }
+    }
+
+    /// Runs `f` against this thread's pool, initializing it and syncing the
+    /// configured capacity on first use or after a limit change.
+    #[inline]
+    fn with_tls_pools<R>(&self, f: impl FnOnce(&ThreadLocalPools) -> R) -> R {
+        let per_thread = self.global_limit_per_thread.load(Ordering::Relaxed);
+        TLS_POOLS.with(|c| {
+            let ptr = c.get();
+            {
+                // SAFETY: pool access is confined to the thread that owns it; see
+                // the `ThreadLocalPools` documentation.
+                let opt = unsafe { &mut *ptr };
+                if opt.is_none() {
+                    *opt = Some(ThreadLocalPools {
+                        tcp_pool: Rc::new(SingleThreadPool::new(per_thread)),
+                        #[cfg(unix)]
+                        unix_pool: Rc::new(SingleThreadPool::new_unbounded()),
+                        last_global_limit: per_thread,
+                        thread_id: std::thread::current().id(),
+                    });
+                }
+                // Here, `opt` is guaranteed to be `Some`, because we just
+                // initialized it if it was `None`
+                let pools = opt.as_mut().expect("invalid thread-local pool state");
+                if pools.last_global_limit != per_thread {
+                    pools.tcp_pool.update_capacity(per_thread);
+                    pools.last_global_limit = per_thread;
+                }
+            }
+
+            // SAFETY: the mutable borrow above has ended. `f` may drop a pool
+            // item, whose `Drop` re-enters through a shared borrow of the same
+            // cell; that is sound because no `&mut` is live here.
+            let pools = unsafe { &*ptr }
+                .as_ref()
+                .expect("invalid thread-local pool state");
+            f(pools)
+        })
     }
 
     /// Pull a connection from the pool, returning immediately.
@@ -351,45 +441,8 @@ impl ConnectionManager {
     ) -> Option<PooledConnection> {
         let upstream_for_stats = upstream.clone();
         let key = (upstream, client_ip);
-        let per_thread = self.global_limit_per_thread.load(Ordering::Relaxed);
 
-        let result = TLS_POOLS.with(|c| {
-            let ptr = c.get();
-            let opt = unsafe { &mut *ptr };
-
-            // Fast path: already initialized and limit matches
-            if let Some(pools) = opt.as_ref() {
-                if pools.last_global_limit == per_thread {
-                    #[cfg(unix)]
-                    if key.0.proxy_unix.is_some() {
-                        return pools
-                            .unix_pool
-                            .pull(key, |c| c.check_ready(Some(idle_timeout)));
-                    }
-                    return pools
-                        .tcp_pool
-                        .pull(key, |c| c.check_ready(Some(idle_timeout)));
-                }
-            }
-
-            // Slow path: initialize or update capacity
-            if opt.is_none() {
-                *opt = Some(ThreadLocalPools {
-                    tcp_pool: Rc::new(SingleThreadPool::new(per_thread)),
-                    #[cfg(unix)]
-                    unix_pool: Rc::new(SingleThreadPool::new_unbounded()),
-                    last_global_limit: per_thread,
-                    thread_id: std::thread::current().id(),
-                });
-            }
-            // Here, `opt` is guaranteed to be `Some`, because we just initialized
-            // it if it was `None`
-            let pools = opt.as_mut().expect("invalid thread-local pool state");
-            if pools.last_global_limit != per_thread {
-                pools.tcp_pool.update_capacity(per_thread);
-                pools.last_global_limit = per_thread;
-            }
-
+        let result = self.with_tls_pools(|pools| {
             #[cfg(unix)]
             if key.0.proxy_unix.is_some() {
                 return pools
@@ -424,45 +477,8 @@ impl ConnectionManager {
         let upstream_key = upstream;
         let key = (upstream_key.clone(), client_ip);
         let limit = local_limit.map(|limit| (upstream_key, limit));
-        let per_thread = self.global_limit_per_thread.load(Ordering::Relaxed);
 
-        let result = TLS_POOLS.with(|c| {
-            let ptr = c.get();
-            let opt = unsafe { &mut *ptr };
-
-            // Fast path: already initialized and limit matches
-            if let Some(pools) = opt.as_ref() {
-                if pools.last_global_limit == per_thread {
-                    #[cfg(unix)]
-                    if key.0.proxy_unix.is_some() {
-                        return pools.unix_pool.pull_with_local_limit(key, limit, |c| {
-                            c.check_ready(Some(idle_timeout))
-                        });
-                    }
-                    return pools
-                        .tcp_pool
-                        .pull_with_local_limit(key, limit, |c| c.check_ready(Some(idle_timeout)));
-                }
-            }
-
-            // Slow path: initialize or update capacity
-            if opt.is_none() {
-                *opt = Some(ThreadLocalPools {
-                    tcp_pool: Rc::new(SingleThreadPool::new(per_thread)),
-                    #[cfg(unix)]
-                    unix_pool: Rc::new(SingleThreadPool::new_unbounded()),
-                    last_global_limit: per_thread,
-                    thread_id: std::thread::current().id(),
-                });
-            }
-            // Here, `opt` is guaranteed to be `Some`, because we just initialized
-            // it if it was `None`
-            let pools = opt.as_mut().expect("invalid thread-local pool state");
-            if pools.last_global_limit != per_thread {
-                pools.tcp_pool.update_capacity(per_thread);
-                pools.last_global_limit = per_thread;
-            }
-
+        let result = self.with_tls_pools(|pools| {
             #[cfg(unix)]
             if key.0.proxy_unix.is_some() {
                 return pools
@@ -472,6 +488,45 @@ impl ConnectionManager {
             pools
                 .tcp_pool
                 .pull_with_local_limit(key, limit, |c| c.check_ready(Some(idle_timeout)))
+        });
+
+        if let Some(result) = &result {
+            let thread_id = get_tls_thread_id();
+            POOL_STATS.record_pull(thread_id, &upstream_for_stats, result.inner().is_some());
+        }
+
+        result.map(PooledConnection::new)
+    }
+
+    /// Pull an idle connection from the pool, returning immediately.
+    ///
+    /// Returns `None` when no stored connection is available. Unlike
+    /// [`Self::try_pull`] this never reserves a capacity slot, which is what
+    /// the reuse-only callers need: reserving a slot and dropping it again would
+    /// release capacity and wake the caller's own waiter, spinning.
+    #[inline]
+    pub fn try_pull_idle(
+        &self,
+        upstream: Arc<ResolvedUpstream>,
+        client_ip: Option<IpAddr>,
+        local_limit: Option<usize>,
+        idle_timeout: Duration,
+    ) -> Option<PooledConnection> {
+        let upstream_for_stats = upstream.clone();
+        let upstream_key = upstream;
+        let key = (upstream_key.clone(), client_ip);
+        let limit = local_limit.map(|limit| (upstream_key, limit));
+
+        let result = self.with_tls_pools(|pools| {
+            #[cfg(unix)]
+            if key.0.proxy_unix.is_some() {
+                return pools
+                    .unix_pool
+                    .pull_idle_with_local_limit(key, limit, |c| c.check_ready(Some(idle_timeout)));
+            }
+            pools
+                .tcp_pool
+                .pull_idle_with_local_limit(key, limit, |c| c.check_ready(Some(idle_timeout)))
         });
 
         if let Some(result) = &result {
@@ -522,7 +577,7 @@ pub fn return_connection_to_pool(
         };
 
         // Freed capacity may unblock a waiter regardless of storing.
-        wake_pending_pull(&local_limit_key, is_unix);
+        wake_pool_waiters(&local_limit_key, is_unix);
 
         stored
     });
@@ -561,41 +616,35 @@ pub fn discard_connection_to_pool(
                 .discard_slot_with_local_limit(local_limit_key.as_ref());
         }
 
-        wake_pending_pull(&local_limit_key, is_unix);
+        wake_pool_waiters(&local_limit_key, is_unix);
     });
 
     let thread_id = get_tls_thread_id();
     POOL_STATS.record_return(thread_id, &key.0, false);
 }
 
-/// Wake one waiter for freed pool capacity, if any.
+/// Wake the waiters that a released slot can help.
 ///
-/// Shared by the return and discard paths: both release an outstanding slot.
+/// Shared by the return and discard paths: both release an outstanding slot. A
+/// release frees capacity in the upstream's own (local-limit) budget and in the
+/// global budget, so both keys are notified. Every waiter registered at this
+/// instant is woken, which is what keeps a request whose upstream is unaffected
+/// by this release from being starved by one that is.
 #[inline]
-fn wake_pending_pull(local_limit_key: &Option<Arc<ResolvedUpstream>>, is_unix: bool) {
-    // Fast path: if no thread is waiting for a connection, skip the
-    // PENDING_PULLS lock entirely. This avoids RwLock contention on the
-    // hot path when the pool is not exhausted.
-    if PENDING_PULL_COUNT.load(Ordering::Relaxed) > 0 {
-        if let Some(pending_pull) = PENDING_PULLS
-            .read()
-            .get(&(local_limit_key.clone(), is_unix))
-            .and_then(|q| q.pop())
-        {
-            // Cancel any pending pull for this local limit key, if one exists.
-            PENDING_PULL_COUNT.fetch_sub(1, Ordering::Relaxed);
-            pending_pull.cancel();
-        } else if local_limit_key.is_some() {
-            if let Some(pending_pull) = PENDING_PULLS
-                .read()
-                .get(&(None, is_unix))
-                .and_then(|q| q.pop())
-            {
-                // Cancel any pending pull for the global key, if one exists.
-                PENDING_PULL_COUNT.fetch_sub(1, Ordering::Relaxed);
-                pending_pull.cancel();
-            }
+fn wake_pool_waiters(local_limit_key: &Option<Arc<ResolvedUpstream>>, is_unix: bool) {
+    let Ok(waiters) = PENDING_WAITERS.read() else {
+        return;
+    };
+
+    let thread_id = std::thread::current().id();
+
+    if let Some(upstream) = local_limit_key {
+        if let Some(notify) = waiters.get(&(Some(upstream.clone()), is_unix, thread_id)) {
+            notify.notify_waiters();
         }
+    }
+    if let Some(notify) = waiters.get(&(None, is_unix, thread_id)) {
+        notify.notify_waiters();
     }
 }
 
@@ -620,8 +669,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    fn obtain_test_connection() -> (PooledConnection, ConnectionManager, Arc<ResolvedUpstream>) {
-        let upstream = Arc::new(crate::types::upstream::ResolvedUpstream {
+    fn test_upstream() -> Arc<ResolvedUpstream> {
+        Arc::new(crate::types::upstream::ResolvedUpstream {
             proxy_to: "http://backend".to_string(),
             connect_to: None,
             proxy_unix: None,
@@ -634,7 +683,11 @@ mod tests {
                 limit: None,
             },
             dns_status: Default::default(),
-        });
+        })
+    }
+
+    fn obtain_test_connection() -> (PooledConnection, ConnectionManager, Arc<ResolvedUpstream>) {
+        let upstream = test_upstream();
         let item = crate::send_request::SendRequestWrapper::empty();
 
         let cm = ConnectionManager::with_global_limit(2);
@@ -697,5 +750,71 @@ mod tests {
 
         // There should be zero idle connections (the connection is discarded earlier)
         assert_eq!(get_stats_snapshot(&up), (0, 0));
+    }
+
+    /// A waiter dropped by its request lifetime (pipeline timeout, client
+    /// disconnect) must not swallow the wake that belongs to a live waiter.
+    ///
+    /// With a queue of cancellation tokens the dropped waiter's token stays
+    /// queued and the next release is spent on it, leaving the live waiter
+    /// asleep next to a free slot until the pipeline timeout kills it too.
+    #[tokio::test]
+    async fn test_cancelled_waiter_does_not_starve_live_waiter() {
+        let upstream = test_upstream();
+        let cm = ConnectionManager::with_global_limit(1);
+
+        let held = cm
+            .try_pull(upstream.clone(), None, Duration::from_secs(10))
+            .expect("failed to occupy the only pool slot");
+
+        // Park a request, then drop it mid-wait.
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(20),
+            cm.pull(upstream.clone(), None, Duration::from_secs(10)),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "the pool accepted a second pull; the test setup is wrong"
+        );
+
+        // A second request must be woken by the release that follows.
+        let mut live = std::pin::pin!(cm.pull(upstream.clone(), None, Duration::from_secs(10)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), live.as_mut())
+                .await
+                .is_err(),
+            "the live waiter returned while the pool was still saturated"
+        );
+
+        drop(held);
+
+        let conn = tokio::time::timeout(Duration::from_secs(5), live.as_mut())
+            .await
+            .expect("live waiter was starved by the abandoned one");
+
+        drop(conn);
+        // The slot was pulled for a connection that was never established, so
+        // releasing it leaves no idle connection behind.
+        assert_eq!(get_stats_snapshot(&upstream), (0, 0));
+    }
+
+    /// The reuse-only pull must not reserve a slot: reserving and releasing one
+    /// on every iteration wakes the caller's own waiter, spinning the loop.
+    #[test]
+    fn test_try_pull_idle_does_not_reserve_a_slot() {
+        let upstream = test_upstream();
+        let cm = ConnectionManager::with_global_limit(1);
+
+        assert!(
+            cm.try_pull_idle(upstream.clone(), None, None, Duration::from_secs(10))
+                .is_none(),
+            "the pool was expected to hold no idle connection"
+        );
+
+        let conn = cm
+            .try_pull(upstream, None, Duration::from_secs(10))
+            .expect("the idle-only pull consumed the only capacity slot");
+        drop(conn);
     }
 }

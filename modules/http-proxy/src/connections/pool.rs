@@ -242,6 +242,17 @@ where
         local_limit: Option<(L, usize)>,
         readiness_fn: impl Fn(&mut I) -> (bool, bool),
     ) -> Option<PoolItem<K, L, I>> {
+        self.pull_inner(key, local_limit, readiness_fn, false)
+    }
+
+    #[inline]
+    fn pull_inner(
+        self: &Rc<Self>,
+        key: K,
+        local_limit: Option<(L, usize)>,
+        readiness_fn: impl Fn(&mut I) -> (bool, bool),
+        idle_only: bool,
+    ) -> Option<PoolItem<K, L, I>> {
         let state = unsafe { &mut *self.inner.get() };
         let local_limit_key = local_limit.as_ref().map(|(limit_key, _)| limit_key.clone());
 
@@ -272,6 +283,11 @@ where
             None
         };
 
+        if inner.is_none() && idle_only {
+            // No stored connection to reuse: leave the accounting untouched.
+            return None;
+        }
+
         if inner.is_some() {
             state.idle_total = state.idle_total.saturating_sub(1);
         } else if self.is_at_global_limit() {
@@ -290,6 +306,22 @@ where
             inner,
             local_limit_key,
         })
+    }
+
+    /// Pulls an idle connection for `key` without reserving a new slot.
+    ///
+    /// Returns `None` when no stored connection is available for the key, so a
+    /// caller that only wants to reuse an existing connection never takes (and
+    /// immediately releases) a capacity slot. Reserving a slot in that loop
+    /// would wake the caller's own waiter through the release path and spin.
+    #[inline]
+    pub fn pull_idle_with_local_limit(
+        self: &Rc<Self>,
+        key: K,
+        local_limit: Option<(L, usize)>,
+        readiness_fn: impl Fn(&mut I) -> (bool, bool),
+    ) -> Option<PoolItem<K, L, I>> {
+        self.pull_inner(key, local_limit, readiness_fn, true)
     }
 
     /// Returns a connection to the pool.
@@ -782,5 +814,35 @@ mod tests {
 
         assert_eq!(pool.outstanding_count(), 0);
         assert_eq!(Rc::strong_count(&pool), pool_rc_before);
+    }
+
+    #[test]
+    fn test_pull_idle_does_not_reserve_slots() {
+        let pool = Rc::new(SingleThreadPool::<String, String, u32>::new(1));
+
+        assert!(pool
+            .pull_idle_with_local_limit("key1".to_string(), None, |_| (true, true))
+            .is_none());
+        assert_eq!(pool.outstanding_count(), 0);
+
+        // The capacity slot is still available for a normal pull.
+        let item = pool
+            .pull("key1".to_string(), |_| (true, true))
+            .expect("the idle-only pull consumed the only slot");
+        drop(item);
+    }
+
+    #[test]
+    fn test_pull_idle_offers_a_returned_connection() {
+        let pool = Rc::new(SingleThreadPool::<String, String, u32>::new(1));
+        pool.return_connection("key1".to_string(), 7);
+
+        let item = pool
+            .pull_idle_with_local_limit("key1".to_string(), None, |_| (true, true))
+            .expect("returned connection was not offered");
+        assert_eq!(item.inner(), &Some(7));
+
+        drop(item);
+        assert_eq!(pool.total_idle_count(), 1);
     }
 }
