@@ -262,6 +262,13 @@ where
             }
         }
 
+        // Connections popped here that no longer pass `readiness_fn` and must not
+        // be kept are dropped. Each of them was counted in `idle_total`, so the
+        // count has to drop with them; otherwise every aged-out idle connection
+        // permanently consumes a capacity slot until the pool refuses to lend
+        // anything on that key.
+        let mut discarded_idle_conns = 0usize;
+
         let inner = if let Some(idle_conns) = state.idle.get_mut(&key) {
             let mut removed_conns = Vec::with_capacity(idle_conns.len());
             let mut found_conn = None;
@@ -272,6 +279,8 @@ where
                     break;
                 } else if should_keep_in_pool {
                     removed_conns.push(inner);
+                } else {
+                    discarded_idle_conns += 1;
                 }
             }
             if found_conn.is_none() && self.is_at_global_limit() {
@@ -282,6 +291,8 @@ where
         } else {
             None
         };
+
+        state.idle_total = state.idle_total.saturating_sub(discarded_idle_conns);
 
         if inner.is_none() && idle_only {
             // No stored connection to reuse: leave the accounting untouched.
@@ -844,5 +855,34 @@ mod tests {
 
         drop(item);
         assert_eq!(pool.total_idle_count(), 1);
+    }
+
+    #[test]
+    fn test_discarded_idle_connection_frees_its_capacity_slot() {
+        // Capacity 1: a single leaked idle connection is enough to make every
+        // later pull on this pool fail, so the leak is directly observable.
+        let pool = Rc::new(SingleThreadPool::<String, String, u32>::new(1));
+
+        pool.return_connection("key1".to_string(), 7);
+        assert_eq!(pool.total_idle_count(), 1);
+
+        // The stored connection is stale: the probe rejects it and refuses to
+        // keep it, so it is dropped instead of returned to the idle map.
+        let item = pool
+            .pull("key1".to_string(), |_| (false, false))
+            .expect("a discarded idle connection still consumed the only slot");
+        assert!(item.inner().is_none());
+        assert_eq!(pool.total_idle_count(), 0);
+
+        drop(item);
+        assert_eq!(pool.outstanding_count(), 0);
+        assert_eq!(pool.total_idle_count(), 0);
+
+        // The freed capacity still serves a fresh logical connection.
+        let next = pool
+            .pull("key2".to_string(), |_| (true, true))
+            .expect("a discarded idle connection leaked the only slot");
+        assert!(next.inner().is_none());
+        drop(next);
     }
 }
